@@ -58,6 +58,17 @@ pub mod touchscreen;
 pub mod types;
 pub mod worker;
 
+// --- Feature modules (filled by sub-agents; declared here so the crate
+// stays compilable while individual modules are authored). ---
+pub mod clock;
+pub mod coverage;
+pub mod video;
+pub mod web_storage;
+pub mod web_socket;
+pub mod js_handle;
+pub mod accessibility;
+pub mod har;
+
 pub use api_request::{APIRequestContext, APIResponse};
 pub use assertions::{expect, expect_page, LocatorAssertions, PageAssertions};
 pub use browser::Browser;
@@ -83,3 +94,18 @@ pub use types::{AriaRole, ConsoleMessage, MouseButton, NameValue, OriginStorage,
 pub use tracing::Tracing;
 pub use touchscreen::Touchscreen;
 pub use worker::Worker;
+
+// --- New feature-module re-exports (Playwright-compatible handles). ---
+pub use accessibility::{Accessibility, AccessibilityNode, AccessibilitySnapshotOptions};
+pub use clock::{Clock, ClockInstallOptions};
+pub use coverage::{
+    Coverage, CSSCoverageEntry, CSSCoverageResult, JSCoverageEntry, JSCoverageResult,
+};
+pub use har::{Har, HarEntry, HarRecorder, HarRequest, HarResponse, RouteFromHarOptions};
+pub use js_handle::JSHandle;
+pub use video::{Video, VideoStartOptions};
+pub use web_socket::{
+    FrameData, FrameDirection, WebSocket, WebSocketFrame, WebSocketHandshake,
+    WebSocketLiveEvent,
+};
+pub use web_storage::WebStorage;
