@@ -1,0 +1,34 @@
+# --- Rust ---
+/target
+# Cargo.lock: this is a library crate — don't pin the lockfile for consumers.
+Cargo.lock
+
+# --- Generated example artifacts ---
+/examples_out/
+/demo.png
+*.png.bak
+
+# --- Coverage / profiling ---
+*.profraw
+*.profdata
+/coverage/
+tarpaulin-report.html
+
+# --- Editor / IDE ---
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.fleet/
+.helix/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Env / local ---
+.env
+.env.*
+!.env.example

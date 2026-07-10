@@ -1,0 +1,84 @@
+[package]
+name = "playwright-cdp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Drive Chromium directly via the Chrome DevTools Protocol (CDP) — no Playwright driver required."
+repository = "https://github.com/liangdi/playwright-cdp"
+
+[lib]
+name = "playwright_cdp"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "time",
+    "sync",
+    "net",
+    "io-util",
+    "fs",
+] }
+tokio-tungstenite = "0.27"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+tempfile = "3"
+dirs = "6"
+parking_lot = "0.12"
+tracing = "0.1"
+base64 = "0.22"
+
+[dev-dependencies]
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[example]]
+name = "interactions"
+path = "examples/interactions.rs"
+
+[[example]]
+name = "assertions"
+path = "examples/assertions.rs"
+
+[[example]]
+name = "network"
+path = "examples/network.rs"
+
+[[example]]
+name = "api_request"
+path = "examples/api_request.rs"
+
+[[example]]
+name = "frames"
+path = "examples/frames.rs"
+
+[[example]]
+name = "page_capture"
+path = "examples/page_capture.rs"
+
+[[example]]
+name = "dialogs_downloads"
+path = "examples/dialogs_downloads.rs"
+
+[[example]]
+name = "contexts"
+path = "examples/contexts.rs"
+
+[[example]]
+name = "bindings"
+path = "examples/bindings.rs"
