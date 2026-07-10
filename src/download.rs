@@ -58,7 +58,6 @@ struct DownloadInner {
     state: DownloadStateCell,
     /// The temp directory Chrome writes downloads into.
     download_path: PathBuf,
-    #[allow(dead_code)]
     page: Page,
 }
 
@@ -86,6 +85,14 @@ impl Download {
     /// The URL being downloaded.
     pub fn url(&self) -> &str {
         &self.inner.url
+    }
+
+    /// The page that owns this download.
+    ///
+    /// Cheap clone — [`Page`] is `Arc`-backed, so the returned handle shares the
+    /// page's state with the caller.
+    pub fn page(&self) -> Page {
+        self.inner.page.clone()
     }
 
     /// The filename suggested by the server (`suggestedFilename`).

@@ -1,9 +1,16 @@
 //! `Page` — a browser tab. Tracks its main execution context, drives
 //! navigation, evaluation, screenshots, and produces locators.
 
+use crate::accessibility::Accessibility;
 use crate::browser::Browser;
 use crate::api_request::APIRequestContext;
 use crate::cdp::session::CdpSession;
+use crate::clock::Clock;
+use crate::coverage::Coverage;
+use crate::js_handle::JSHandle;
+use crate::video::Video;
+use crate::web_socket::{WebSocket, WebSocketRegistry};
+use crate::web_storage::WebStorage;
 use crate::download::{Download, DownloadState, DownloadStateCell};
 use crate::element_handle::ElementHandle;
 use crate::error::{Error, Result};
@@ -54,6 +61,11 @@ struct PageInner {
     session: Arc<CdpSession>,
     target_id: String,
     main_world_ctx: Arc<Mutex<Option<i64>>>,
+    /// Per-frame main-world execution contexts: `frame_id → context id`.
+    /// Populated by the `context_tracker` from
+    /// `Runtime.executionContextCreated { auxData.frameId }`. Used to scope
+    /// `Frame` evaluate/locator resolution to a child frame's own context.
+    frame_contexts: Arc<Mutex<HashMap<String, i64>>>,
     default_timeout_ms: AtomicU64,
     default_navigation_timeout_ms: AtomicU64,
     viewport: Mutex<Option<Viewport>>,
@@ -81,6 +93,13 @@ struct PageInner {
     // Touchscreen: a one-shot flag for enabling touch emulation. Arc-wrapped so
     // it can be shared across `Touchscreen` clones produced from this page.
     touch_emulation_started: Arc<AtomicBool>,
+    // WebSocket capture: a registry that subscribes to the page session and
+    // accumulates one `WebSocket` per `Network.webSocket*` connection. Attached
+    // in `Page::attach` BEFORE `Network.enable` so no event is missed.
+    web_socket_registry: Arc<WebSocketRegistry>,
+    // Optional pre-configured video output path (Playwright configures the video
+    // path up front at context/page creation time).
+    video_path: Mutex<Option<PathBuf>>,
 }
 
 /// Cached frame-tree data for one frame.
@@ -113,14 +132,31 @@ impl Page {
         session.set_default_timeout_ms(default_timeout_ms);
 
         let main_world_ctx: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+        let frame_contexts: Arc<Mutex<HashMap<String, i64>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // The main frame id and frame store are shared with the context tracker
+        // (so it can tell the main frame's default context apart from a child
+        // frame's) and the frame tracker.
+        let frames_store: Arc<Mutex<HashMap<String, FrameData>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let main_frame_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let ctx_rx = session.subscribe();
         // Context-tracking + engine re-injection task. Subscribe before
         // enabling Runtime so the initial executionContextCreated is captured.
         {
             let session_for_task = Arc::clone(&session);
             let ctx_cell = Arc::clone(&main_world_ctx);
+            let frame_ctx_cell = Arc::clone(&frame_contexts);
+            let main_id_cell = Arc::clone(&main_frame_id);
             tokio::spawn(async move {
-                context_tracker(ctx_rx, session_for_task, ctx_cell).await;
+                context_tracker(
+                    ctx_rx,
+                    session_for_task,
+                    ctx_cell,
+                    frame_ctx_cell,
+                    main_id_cell,
+                )
+                .await;
             });
         }
 
@@ -159,6 +195,7 @@ impl Page {
                 session: Arc::clone(&session),
                 target_id,
                 main_world_ctx: Arc::clone(&main_world_ctx),
+                frame_contexts: Arc::clone(&frame_contexts),
                 default_timeout_ms: AtomicU64::new(default_timeout_ms),
                 default_navigation_timeout_ms: AtomicU64::new(default_timeout_ms),
                 viewport: Mutex::new(viewport),
@@ -167,8 +204,8 @@ impl Page {
                 on_request_handlers,
                 on_response_handlers,
                 on_requestfailed_handlers,
-                frames: Arc::new(Mutex::new(HashMap::new())),
-                main_frame_id: Arc::new(Mutex::new(None)),
+                frames: Arc::clone(&frames_store),
+                main_frame_id: Arc::clone(&main_frame_id),
                 route_handlers: Arc::new(Mutex::new(Vec::new())),
                 route_started: AtomicBool::new(false),
                 on_close_handlers: Mutex::new(Vec::new()),
@@ -180,8 +217,14 @@ impl Page {
                 filechooser_started: AtomicBool::new(false),
                 worker_started: AtomicBool::new(false),
                 touch_emulation_started: Arc::new(AtomicBool::new(false)),
+                web_socket_registry: Arc::new(WebSocketRegistry::new()),
+                video_path: Mutex::new(None),
             }),
         };
+
+        // WebSocket capture: attach the registry's subscriber BEFORE
+        // Network.enable is sent so no `Network.webSocket*` event is missed.
+        page.inner.web_socket_registry.attach(&page.inner.session);
 
         // Live frame-tree tracking (urls/names/children) for `Frame`.
         {
@@ -239,21 +282,83 @@ impl Page {
         &self.inner.session
     }
 
+    /// The owning CDP session as a cloned `Arc`, for building a [`JSHandle`]
+    /// (which retains its own `Arc<CdpSession>`).
+    pub(crate) fn session_arc(&self) -> Arc<CdpSession> {
+        Arc::clone(&self.inner.session)
+    }
+
     pub(crate) fn context_id(&self) -> Option<i64> {
         self.inner.main_world_ctx.lock().as_ref().copied()
     }
 
-    /// The current main-world execution context, waiting briefly for one to
-    /// become available after a navigation (when the old context is destroyed
-    /// before the new one is reported).
+    /// The execution context to use for page-level evaluation.
+    ///
+    /// Returns `None` intentionally: omitting `contextId` from
+    /// `Runtime.evaluate` lets CDP resolve the page's default (main-world)
+    /// context itself, which is always fresh and avoids the stale-context race
+    /// that occurs right after a navigation (when the old context is destroyed
+    /// before the new one is reported and our tracker has not caught up).
+    ///
+    /// The tracked id ([`context_id`](Self::context_id)) is still maintained
+    /// for callers that need a concrete handle (e.g. [`JSHandle`] context
+    /// tagging) and to seed per-frame lookups.
     pub(crate) async fn ctx(&self) -> Option<i64> {
+        None
+    }
+
+    /// The execution-context id to use when targeting `frame_id`.
+    ///
+    /// Returns `None` for the page's main frame (so its ops run in CDP's
+    /// default, race-free context) and `Some(child_ctx)` for a child frame's
+    /// own context. If a child frame's context has not been reported yet,
+    /// returns `None` as a safe fallback (default context).
+    pub(crate) fn context_for_frame(&self, frame_id: &str) -> Option<i64> {
+        // The main frame uses the default context (no id) to stay race-free.
+        if self
+            .inner
+            .main_frame_id
+            .lock()
+            .as_deref()
+            .map(|m| m == frame_id)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.inner
+            .frame_contexts
+            .lock()
+            .get(frame_id)
+            .copied()
+            // Unknown child frame: fall back to the default context.
+            .or(None)
+    }
+
+    /// Like [`context_for_frame`](Self::context_for_frame), but waits briefly
+    /// for a child frame's context to arrive (the context-tracker is
+    /// asynchronous and may lag a freshly-attached frame). The main frame
+    /// returns `None` immediately.
+    pub(crate) async fn ctx_for_frame(&self, frame_id: &str) -> Option<i64> {
+        // Main frame: default context, no waiting.
+        if self
+            .inner
+            .main_frame_id
+            .lock()
+            .as_deref()
+            .map(|m| m == frame_id)
+            .unwrap_or(false)
+        {
+            return None;
+        }
         let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
         loop {
-            if let Some(id) = self.context_id() {
+            if let Some(id) = self.inner.frame_contexts.lock().get(frame_id).copied() {
                 return Some(id);
             }
             if tokio::time::Instant::now() >= deadline {
-                return self.context_id();
+                // Unknown child frame: fall back to the default context rather
+                // than erroring.
+                return None;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -271,7 +376,11 @@ impl Page {
         *self.inner.closed.lock()
     }
 
-    pub(crate) fn set_default_timeout(&self, ms: u64) {
+    /// Set the default timeout (ms) for all actions on this page, mirroring
+    /// Playwright's `page.setDefaultTimeout`. The value is stored on the page
+    /// ([`PageInner::default_timeout_ms`]) and propagated to the underlying
+    /// CDP session's command timeout.
+    pub fn set_default_timeout(&self, ms: u64) {
         self.inner.default_timeout_ms.store(ms, Ordering::Relaxed);
         self.inner.session.set_default_timeout_ms(ms);
     }
@@ -618,6 +727,36 @@ impl Page {
         let v = selectors::eval_context(&self.inner.session, self.ctx().await, &function, Value::Null)
             .await?;
         serde_json::from_value::<R>(v).map_err(Error::from)
+    }
+
+    /// Evaluate a JS expression in the main world, returning a [`JSHandle`] to
+    /// the result (returned by reference, not by value). Mirrors Playwright's
+    /// `page.evaluateHandle`.
+    ///
+    /// Like [`evaluate`](Self::evaluate), `expression` is wrapped as
+    /// `(arg) => { return (<expression>); }` and run against the page's main
+    /// world. The returned `Runtime.RemoteObjectId` is captured and wrapped in
+    /// a [`JSHandle`]. Returns an error if the evaluation yields `null`/
+    /// `undefined` (no remote object to reference).
+    pub async fn evaluate_handle(&self, expression: &str) -> Result<JSHandle> {
+        let function = format!("(arg) => {{ return ({expression}); }}");
+        let object_id = selectors::eval_context_handle(
+            &self.inner.session,
+            self.ctx().await,
+            &function,
+            Value::Null,
+        )
+        .await?
+        .ok_or_else(|| {
+            Error::ProtocolError(
+                "evaluate_handle returned no remote object (null/undefined result)".into(),
+            )
+        })?;
+        Ok(JSHandle::with_context(
+            Arc::clone(&self.inner.session),
+            object_id,
+            self.context_id(),
+        ))
     }
 
     /// Evaluate a JS expression with a JSON-serializable argument.
@@ -1056,6 +1195,89 @@ impl Page {
         Touchscreen::with_flag(self.clone(), Arc::clone(&self.inner.touch_emulation_started))
     }
 
+    // --- feature handles (wave-1 modules) ---
+
+    /// The page video capture handle, mirroring Playwright's `page.video()`.
+    ///
+    /// If a video output path was configured for the page, it is pre-recorded on
+    /// the handle (via [`Video::with_path`]); otherwise the handle starts with
+    /// no path and one can be supplied at [`Video::start`].
+    pub fn video(&self) -> Video {
+        let session = Arc::clone(&self.inner.session);
+        match self.inner.video_path.lock().clone() {
+            Some(path) => Video::with_path(session, path),
+            None => Video::new(session),
+        }
+    }
+
+    /// The page accessibility-tree handle, mirroring Playwright's
+    /// `page.accessibility()`.
+    pub fn accessibility(&self) -> Accessibility {
+        Accessibility::new(self.target_session())
+    }
+
+    /// The page code-coverage handle, mirroring Playwright's
+    /// `page.coverage()`.
+    pub fn coverage(&self) -> Coverage {
+        Coverage::new(self.target_session())
+    }
+
+    /// The page fake-timer handle, mirroring Playwright's `page.clock()`.
+    pub fn clock(&self) -> Clock {
+        Clock::new(self.target_session())
+    }
+
+    /// The page's `localStorage` for its current security origin, mirroring
+    /// Playwright's `page.evaluate(() => localStorage)`-backed access but
+    /// speaking CDP's `DOMStorage` domain directly.
+    ///
+    /// The origin is derived from the current `location.href` (scheme://host
+    /// with port). Returns a best-effort handle; if the URL has no parseable
+    /// origin (e.g. `about:blank`), the empty string is used as the origin.
+    pub async fn web_storage(&self) -> WebStorage {
+        let origin = self.security_origin().await;
+        WebStorage::local_storage(self.target_session(), origin)
+    }
+
+    /// The page's `localStorage` for its current security origin.
+    pub async fn local_storage(&self) -> WebStorage {
+        let origin = self.security_origin().await;
+        WebStorage::local_storage(self.target_session(), origin)
+    }
+
+    /// The page's `sessionStorage` for its current security origin.
+    pub async fn session_storage(&self) -> WebStorage {
+        let origin = self.security_origin().await;
+        WebStorage::session_storage(self.target_session(), origin)
+    }
+
+    /// Build a by-value [`CdpSession`] for this page's target.
+    ///
+    /// The wave-1 feature modules ([`Coverage`], [`Clock`], [`WebStorage`],
+    /// [`Accessibility`]) own their session by value, but the page holds its
+    /// session behind an `Arc`. We rebuild an equivalent target-level session
+    /// (same connection + session id) and re-apply the page's default timeout
+    /// so command timeouts match the page's configured value.
+    fn target_session(&self) -> CdpSession {
+        let conn = self.inner.session.connection().clone();
+        let session_id = self
+            .inner
+            .session
+            .session_id()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let session = CdpSession::target(conn, session_id);
+        session.set_default_timeout_ms(self.inner.default_timeout_ms.load(Ordering::Relaxed));
+        session
+    }
+
+    /// Derive the security origin (`scheme://host[:port]`) from the current page
+    /// URL. Falls back to an empty origin for opaque URLs like `about:blank`.
+    async fn security_origin(&self) -> String {
+        let url = self.url().await.unwrap_or_default();
+        derive_security_origin(&url)
+    }
+
     pub fn main_frame(&self) -> Frame {
         Frame::main(self.clone())
     }
@@ -1120,6 +1342,97 @@ impl Page {
                 if ev.method == "Runtime.consoleAPICalled" {
                     let msg = parse_console(&ev.params);
                     handler(msg).await;
+                }
+            }
+        });
+    }
+
+    /// Register a handler invoked when the page fires its `load` event
+    /// (`Page.loadEventFired`), mirroring Playwright's `page.on('load')`.
+    pub fn on_load<F, Fut>(&self, handler: F)
+    where
+        F: Fn(()) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut rx = self.inner.session.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if ev.method == "Page.loadEventFired" {
+                    handler(()).await;
+                }
+            }
+        });
+    }
+
+    /// Register a handler invoked when the page crashes (`Inspector.targetCrashed`),
+    /// mirroring Playwright's `page.on('crash')`.
+    pub fn on_crash<F, Fut>(&self, handler: F)
+    where
+        F: Fn(()) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut rx = self.inner.session.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if ev.method == "Inspector.targetCrashed" {
+                    handler(()).await;
+                }
+            }
+        });
+    }
+
+    /// Register a handler invoked when a frame is attached to the page
+    /// (`Page.frameAttached`), mirroring Playwright's `page.on('frameattached')`.
+    pub fn on_frameattached<F, Fut>(&self, handler: F)
+    where
+        F: Fn(FrameEvent) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut rx = self.inner.session.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if ev.method == "Page.frameAttached" {
+                    if let Some(fe) = FrameEvent::from_attached(&ev.params) {
+                        handler(fe).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Register a handler invoked when a frame is detached from the page
+    /// (`Page.frameDetached`), mirroring Playwright's `page.on('framedetached')`.
+    pub fn on_framedetached<F, Fut>(&self, handler: F)
+    where
+        F: Fn(FrameEvent) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut rx = self.inner.session.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if ev.method == "Page.frameDetached" {
+                    if let Some(fe) = FrameEvent::from_detached(&ev.params) {
+                        handler(fe).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Register a handler invoked when a frame is navigated to a new URL
+    /// (`Page.frameNavigated`), mirroring Playwright's `page.on('framenavigated')`.
+    pub fn on_framenavigated<F, Fut>(&self, handler: F)
+    where
+        F: Fn(FrameEvent) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut rx = self.inner.session.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if ev.method == "Page.frameNavigated" {
+                    if let Some(fe) = FrameEvent::from_navigated(&ev.params) {
+                        handler(fe).await;
+                    }
                 }
             }
         });
@@ -1192,6 +1505,39 @@ impl Page {
                         .to_string();
                     handler(msg).await;
                 }
+            }
+        });
+    }
+
+    /// Register a handler invoked for each new WebSocket connection, mirroring
+    /// Playwright's `page.on('websocket')`.
+    ///
+    /// Capture is always on: the page's [`WebSocketRegistry`] subscribes to the
+    /// session in [`Page::attach`] (before `Network.enable`), so every
+    /// `Network.webSocket*` event is already being accumulated into a
+    /// [`WebSocket`] handle. This method registers against the registry's
+    /// created-connection bus and invokes `handler` for each newly-created
+    /// connection. Connections created *before* this call are not replayed —
+    /// register the handler early (before the page opens the socket) to observe
+    /// every one.
+    pub fn on_websocket<F, Fut>(&self, handler: F)
+    where
+        F: Fn(WebSocket) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut rx = self.inner.web_socket_registry.on_created();
+        // Wrap in an Arc<dyn Fn> so the handler can be invoked from each
+        // spawned task without being moved out of the loop.
+        let handler: Arc<dyn Fn(WebSocket) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync> =
+            Arc::new(move |ws| Box::pin(handler(ws)));
+        tokio::spawn(async move {
+            while let Ok(ws) = rx.recv().await {
+                let h = Arc::clone(&handler);
+                // Invoke on its own task so a slow handler doesn't stall the
+                // registry's broadcast bus.
+                tokio::spawn(async move {
+                    h(ws).await;
+                });
             }
         });
     }
@@ -1597,9 +1943,34 @@ fn attr_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Derive the CDP `securityOrigin` (`scheme://host[:port]`) from a URL string.
+///
+/// Opaque schemes (`about:`, `data:`, `blob:`) yield an empty origin, since
+/// `DOMStorage` has nothing to scope to for them. A URL without a parseable
+/// scheme also yields an empty origin.
+fn derive_security_origin(url: &str) -> String {
+    // Find the scheme delimiter.
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => return String::new(),
+    };
+    let scheme = &url[..url.find("://").unwrap()];
+    // Opaque/special schemes have no real origin.
+    if matches!(scheme, "about" | "data" | "blob" | "javascript") {
+        return String::new();
+    }
+    // The authority ends at the first `/`, `?`, or `#`.
+    let end = after_scheme
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..end];
+    if authority.is_empty() {
+        return String::new();
+    }
+    format!("{scheme}://{authority}")
+}
+
 /// Whether a JSON value is "truthy" for `wait_for_function`: `null`, `false`,
-/// `0`, and `""` are not-yet-truthy; everything else (objects, arrays, nonzero
-/// numbers, non-empty strings) is truthy.
 fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
@@ -1921,62 +2292,130 @@ fn parse_console(params: &Value) -> ConsoleMessage {    let text = params
         .and_then(|v| v.as_str())
         .unwrap_or("log")
         .to_string();
-    ConsoleMessage { text, r#type: kind }
+    // Source location from the top call frame of the reported stack trace.
+    let location = params
+        .get("stackTrace")
+        .and_then(|s| s.get("callFrames"))
+        .and_then(|f| f.as_array())
+        .and_then(|frames| frames.first())
+        .map(|frame| {
+            use crate::types::ConsoleMessageLocation;
+            ConsoleMessageLocation {
+                url: frame
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                line_number: frame.get("lineNumber").and_then(|v| v.as_i64()),
+                column_number: frame.get("columnNumber").and_then(|v| v.as_i64()),
+            }
+        });
+    ConsoleMessage {
+        text,
+        r#type: kind,
+        location,
+    }
 }
 
 /// Background task: track the main-world execution context and keep the
-/// selector engine installed after navigations.
+/// selector engine installed after navigations. Also records per-frame
+/// contexts (frame id → context id) from `auxData.frameId` so child-frame
+/// evaluation/locator resolution can target a frame's own context.
+///
+/// `main_world_ctx` is set ONLY for the main (top) frame's default context —
+/// a child iframe also has a "default" context, and accepting every default
+/// context would let the child's context clobber the main one.
 async fn context_tracker(
     mut rx: broadcast::Receiver<crate::cdp::CdpEvent>,
     session: Arc<CdpSession>,
     ctx_cell: Arc<Mutex<Option<i64>>>,
+    frame_ctx_cell: Arc<Mutex<HashMap<String, i64>>>,
+    main_frame_id: Arc<Mutex<Option<String>>>,
 ) {
     loop {
         match rx.recv().await {
             Ok(ev) => match ev.method.as_str() {
                 "Runtime.executionContextCreated" => {
-                    let is_default = ev
-                        .params
-                        .get("context")
-                        .and_then(|c| c.get("auxData"))
+                    let context = match ev.params.get("context") {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let aux = context.get("auxData");
+                    let is_default = aux
                         .and_then(|a| a.get("type"))
                         .and_then(|t| t.as_str())
                         == Some("default");
+                    let id = context.get("id").and_then(|i| i.as_i64());
+                    let Some(id) = id else { continue };
+
+                    let frame_id = aux
+                        .and_then(|a| a.get("frameId"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+
                     if is_default {
-                        let id = ev
-                            .params
-                            .get("context")
-                            .and_then(|c| c.get("id"))
-                            .and_then(|i| i.as_i64());
-                        if let Some(id) = id {
+                        // Record the frame → context mapping. Only default
+                        // (main-world) contexts are tracked; utility/isolated
+                        // worlds have their own ids and must not shadow a
+                        // frame's main context.
+                        if let Some(fid) = &frame_id {
+                            frame_ctx_cell.lock().insert(fid.clone(), id);
+                        }
+
+                        // The page-wide "main" context is the main frame's
+                        // default context. A child iframe's default context
+                        // must NOT overwrite it. Accept this context as main
+                        // when (a) its frame is the known main frame, or
+                        // (b) the main frame id is not yet known and no main
+                        // context has been recorded yet (initial top-frame
+                        // context typically arrives before the frame tree is
+                        // populated).
+                        let main_id = main_frame_id.lock().clone();
+                        let is_main_frame = match (&main_id, &frame_id) {
+                            (Some(m), Some(f)) => m == f,
+                            (None, _) => ctx_cell.lock().is_none(),
+                            // main frame known but this context has no frameId:
+                            // treat as main only if none recorded yet.
+                            (Some(_), None) => ctx_cell.lock().is_none(),
+                        };
+                        if is_main_frame {
                             *ctx_cell.lock() = Some(id);
-                            // Ensure the engine is installed in this context.
-                            let s = Arc::clone(&session);
-                            tokio::spawn(async move {
-                                let _ = s
-                                    .send(
-                                        "Runtime.evaluate",
-                                        json!({
-                                            "expression": selectors::INJECTED_SCRIPT,
-                                            "contextId": id,
-                                        }),
-                                    )
-                                    .await;
-                            });
                         }
                     }
+
+                    // Ensure the engine is installed in this context.
+                    let s = Arc::clone(&session);
+                    tokio::spawn(async move {
+                        let _ = s
+                            .send(
+                                "Runtime.evaluate",
+                                json!({
+                                    "expression": selectors::INJECTED_SCRIPT,
+                                    "contextId": id,
+                                }),
+                            )
+                            .await;
+                    });
                 }
                 "Runtime.executionContextsCleared" => {
                     *ctx_cell.lock() = None;
+                    frame_ctx_cell.lock().clear();
                 }
                 "Runtime.executionContextDestroyed" => {
                     let id = ev
                         .params
                         .get("executionContextId")
                         .and_then(|v| v.as_i64());
-                    let mut cell = ctx_cell.lock();
-                    if id.is_some() && *cell == id {
-                        *cell = None;
+                    {
+                        let mut cell = ctx_cell.lock();
+                        if id.is_some() && *cell == id {
+                            *cell = None;
+                        }
+                    }
+                    if let Some(id) = id {
+                        let mut frames = frame_ctx_cell.lock();
+                        // Drop any frame→context entries that pointed at the
+                        // destroyed context (a new contextCreated will repopulate).
+                        frames.retain(|_, v| *v != id);
                     }
                 }
                 _ => {}
@@ -1984,6 +2423,79 @@ async fn context_tracker(
             Err(broadcast::error::RecvError::Closed) => break,
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
         }
+    }
+}
+
+/// A frame lifecycle event payload for `on_frameattached` /
+/// `on_framedetached` / `on_framenavigated`. Carries the frame id, its
+/// parent's id (if any), and — for navigations — the frame's new URL.
+#[derive(Debug, Clone)]
+pub struct FrameEvent {
+    /// The id of the frame the event concerns.
+    pub id: String,
+    /// The parent frame id, if the frame has one (the main frame does not).
+    pub parent_id: Option<String>,
+    /// The frame's URL. Populated for navigations; empty for attach/detach.
+    pub url: String,
+}
+
+impl FrameEvent {
+    /// Parse `Page.frameAttached` params (`params.frame.{id,parentFrameId}`).
+    pub(crate) fn from_attached(params: &Value) -> Option<Self> {
+        let frame = params.get("frame").unwrap_or(params);
+        let id = frame.get("id").and_then(|v| v.as_str())?.to_string();
+        let parent_id = frame
+            .get("parentFrameId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Some(Self {
+            id,
+            parent_id,
+            url: String::new(),
+        })
+    }
+
+    /// Parse `Page.frameDetached` params (`params.frameId`, plus any `frame`).
+    pub(crate) fn from_detached(params: &Value) -> Option<Self> {
+        // frameDetached carries a bare `frameId`; `frame` may be absent.
+        let id = params
+            .get("frameId")
+            .or_else(|| params.get("frame"))
+            .and_then(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .or_else(|| v.get("id").and_then(|i| i.as_str()).map(String::from))
+            })?;
+        let parent_id = params
+            .get("frame")
+            .and_then(|f| f.get("parentFrameId"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Some(Self {
+            id,
+            parent_id,
+            url: String::new(),
+        })
+    }
+
+    /// Parse `Page.frameNavigated` params (`params.frame.{id,url,parentId}`).
+    pub(crate) fn from_navigated(params: &Value) -> Option<Self> {
+        let frame = params.get("frame")?;
+        let id = frame.get("id").and_then(|v| v.as_str())?.to_string();
+        let url = frame
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let parent_id = frame
+            .get("parentId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Some(Self {
+            id,
+            parent_id,
+            url,
+        })
     }
 }
 

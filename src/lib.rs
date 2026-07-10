@@ -101,6 +101,7 @@ pub use clock::{Clock, ClockInstallOptions};
 pub use coverage::{
     Coverage, CSSCoverageEntry, CSSCoverageResult, JSCoverageEntry, JSCoverageResult,
 };
+pub use element_handle::ElementState;
 pub use har::{Har, HarEntry, HarRecorder, HarRequest, HarResponse, RouteFromHarOptions};
 pub use js_handle::JSHandle;
 pub use video::{Video, VideoStartOptions};
@@ -109,3 +110,5 @@ pub use web_socket::{
     WebSocketLiveEvent,
 };
 pub use web_storage::WebStorage;
+// Network detail DTOs surfaced by `Request` / `Response`.
+pub use network::{ServerAddr, SecurityDetails, Sizes, Timing};

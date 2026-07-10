@@ -345,11 +345,41 @@ pub struct StorageState {
 /// Extra HTTP headers map.
 pub type Headers = HashMap<String, String>;
 
+/// The source location of a [`ConsoleMessage`], mirroring the top frame of a
+/// CDP `Runtime.consoleAPICalled` `stackTrace.callFrames[0]`.
+///
+/// All fields are optional since CDP omits them when no stack trace is
+/// available (e.g. for some console methods or contexts without a script).
+#[derive(Debug, Clone, Default)]
+pub struct ConsoleMessageLocation {
+    /// The script URL where the call originated.
+    pub url: Option<String>,
+    /// 1-based line number.
+    pub line_number: Option<i64>,
+    /// 1-based column number.
+    pub column_number: Option<i64>,
+}
+
+impl ConsoleMessageLocation {
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+    pub fn line_number(&self) -> Option<i64> {
+        self.line_number
+    }
+    pub fn column_number(&self) -> Option<i64> {
+        self.column_number
+    }
+}
+
 /// A console message captured from the page.
 #[derive(Debug, Clone)]
 pub struct ConsoleMessage {
     pub text: String,
     pub r#type: String,
+    /// The source location, parsed from the call's `stackTrace.callFrames[0]`.
+    /// `None` when CDP did not report a stack trace.
+    pub location: Option<ConsoleMessageLocation>,
 }
 
 impl ConsoleMessage {
@@ -358,5 +388,74 @@ impl ConsoleMessage {
     }
     pub fn r#type(&self) -> &str {
         &self.r#type
+    }
+    pub fn location(&self) -> Option<&ConsoleMessageLocation> {
+        self.location.as_ref()
+    }
+}
+
+/// An error thrown from page JavaScript (e.g. an unhandled exception or a
+/// rejected promise observed via `Runtime.exceptionThrown`).
+///
+/// Self-contained DTO mirroring the useful fields of CDP's
+/// `Runtime.exceptionThrown` payload.
+#[derive(Debug, Clone, Default)]
+pub struct WebError {
+    /// Top-level message, if any.
+    pub message: Option<String>,
+    /// The stack trace, if any.
+    pub stack: Option<String>,
+    /// The script where it originated, if known.
+    pub url: Option<String>,
+    /// 1-based line/column, if known.
+    pub line_number: Option<i64>,
+    pub column_number: Option<i64>,
+}
+
+impl WebError {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// TLS/security details for a response, mirroring CDP's
+/// `Security/securityStateChanged` / `Network.responseReceived` security info.
+///
+/// Self-contained DTO; all fields optional since CDP omits any that don't apply
+/// to a given connection.
+#[derive(Debug, Clone, Default)]
+pub struct SecurityDetails {
+    /// TLS protocol (e.g. `"TLS 1.3"`), if known.
+    pub protocol: Option<String>,
+    /// Cipher name, if known.
+    pub cipher: Option<String>,
+    /// Issuer of the server certificate, if known.
+    pub issuer: Option<String>,
+    /// Subject (CN) of the server certificate, if known.
+    pub subject_name: Option<String>,
+    /// Unix-epoch seconds at which the certificate is valid from, if known.
+    pub valid_from: Option<f64>,
+    /// Unix-epoch seconds at which the certificate expires, if known.
+    pub valid_to: Option<f64>,
+}
+
+impl SecurityDetails {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a `SecurityDetails` from a CDP `SecurityDetails` JSON object (as
+    /// carried by `Network.responseReceivedExtraInfo` /
+    /// `Network.responseReceived`). Unknown shapes yield all-`None`.
+    pub fn from_cdp(value: &Value) -> Self {
+        let get = |k: &str| value.get(k).and_then(|v| v.as_str()).map(String::from);
+        Self {
+            protocol: get("protocol"),
+            cipher: get("cipher"),
+            issuer: get("issuer"),
+            subject_name: get("subjectName").or_else(|| get("subject_name")),
+            valid_from: value.get("validFrom").and_then(|v| v.as_f64()),
+            valid_to: value.get("validTo").and_then(|v| v.as_f64()),
+        }
     }
 }

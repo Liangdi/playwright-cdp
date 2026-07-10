@@ -107,29 +107,33 @@ pub(crate) async fn element_at_in(
 
 // --- low-level evaluation wrappers ------------------------------------------
 //
-// Page-level evaluation uses `Runtime.evaluate` (no `executionContextId`),
-// which always runs in the page's default/main world. This sidesteps the
-// stale-context race after navigations: caching a context id is fragile because
-// a context can be destroyed (and recreated) before our tracker observes it.
+// When a `ctx` (execution-context id) is supplied, evaluation runs in that
+// context via `Runtime.evaluate { contextId }`. This is required for
+// child-frame scoping: each frame has its own main-world context, and the
+// top-level page's default context sees only its own document.
+//
+// When `ctx` is `None` we omit `contextId`, letting CDP pick the page's default
+// main-world context. This is the legacy path and what most page-level helpers
+// used before per-frame contexts were tracked.
 
-/// Evaluate a `(arg) => ...` function in the main world, returning by value.
+/// Evaluate a `(arg) => ...` function in `ctx`'s execution context (or the
+/// page's default context if `ctx` is `None`), returning by value.
 pub(crate) async fn eval_context(
     session: &CdpSession,
-    _ctx: Option<i64>,
+    ctx: Option<i64>,
     function: &str,
     arg: Value,
 ) -> Result<Value> {
     let expr = format!("({})({})", function, serde_json::to_string(&arg)?);
-    let resp = session
-        .send(
-            "Runtime.evaluate",
-            json!({
-                "expression": expr,
-                "returnByValue": true,
-                "awaitPromise": true,
-            }),
-        )
-        .await?;
+    let mut params = json!({
+        "expression": expr,
+        "returnByValue": true,
+        "awaitPromise": true,
+    });
+    if let Some(id) = ctx {
+        params["contextId"] = json!(id);
+    }
+    let resp = session.send("Runtime.evaluate", params).await?;
     if let Some(exc) = resp.get("exceptionDetails") {
         let msg = exc
             .get("exception")
@@ -145,25 +149,25 @@ pub(crate) async fn eval_context(
         .unwrap_or(Value::Null))
 }
 
-/// Evaluate a `(arg) => ...` function in the main world, returning a
-/// `RemoteObjectId` for the returned object (or `None` for null/undefined).
+/// Evaluate a `(arg) => ...` function in `ctx`'s execution context (or the
+/// page's default context if `ctx` is `None`), returning a `RemoteObjectId` for
+/// the returned object (or `None` for null/undefined).
 pub(crate) async fn eval_context_handle(
     session: &CdpSession,
-    _ctx: Option<i64>,
+    ctx: Option<i64>,
     function: &str,
     arg: Value,
 ) -> Result<Option<String>> {
     let expr = format!("({})({})", function, serde_json::to_string(&arg)?);
-    let resp = session
-        .send(
-            "Runtime.evaluate",
-            json!({
-                "expression": expr,
-                "returnByValue": false,
-                "awaitPromise": true,
-            }),
-        )
-        .await?;
+    let mut params = json!({
+        "expression": expr,
+        "returnByValue": false,
+        "awaitPromise": true,
+    });
+    if let Some(id) = ctx {
+        params["contextId"] = json!(id);
+    }
+    let resp = session.send("Runtime.evaluate", params).await?;
     if let Some(exc) = resp.get("exceptionDetails") {
         let msg = exc
             .get("exception")
