@@ -19,4 +19,4 @@ upgrade:
     cargo +nightly update --breaking -Z unstable-options
 
 publish:
-    cargi publish --registry crates-io
+    cargo publish --registry crates-io

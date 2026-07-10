@@ -3,9 +3,16 @@ name = "playwright-cdp"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
+authors = ["Liangdi <wu@liangdi.me>"]
 license = "Apache-2.0"
 description = "Drive Chromium directly via the Chrome DevTools Protocol (CDP) — no Playwright driver required."
+homepage = "https://github.com/liangdi/playwright-cdp"
 repository = "https://github.com/liangdi/playwright-cdp"
+documentation = "https://docs.rs/playwright-cdp"
+readme = "README.md"
+keywords = ["playwright", "cdp", "chromium", "browser-automation", "devtools"]
+categories = ["web-programming", "development-tools::testing", "api-bindings"]
+exclude = ["cliff.toml", "justfile", "release.toml", "/examples_out", "/demo.png"]
 
 [lib]
 name = "playwright_cdp"
