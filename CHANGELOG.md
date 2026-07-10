@@ -1,3 +1,16 @@
+## [0.3.0] - 2026-07-10
+
+### 🚀 Features
+
+- Complete Playwright-compatible API surface
+
+### 📚 Documentation
+
+- Runnable examples for the new APIs
+
+### 🧪 Testing
+
+- Smoke tests for the new API surface + concurrent server helper
 ## [0.2.0] - 2026-07-10
 
 ### 🚀 Features
@@ -12,6 +25,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update
+- Release playwright-cdp version 0.2.0
 ## [0.1.1] - 2026-07-10
 
 ### 💼 Other
