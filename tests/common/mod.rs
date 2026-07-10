@@ -24,17 +24,25 @@ pub async fn http_server(body: &'static str) -> String {
 
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf).await;
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.flush().await;
+            let Ok((sock, _)) = listener.accept().await else { break };
+            let body = body;
+            // Handle each connection on its own task so a stalled/paused
+            // connection (e.g. a browser request held by Fetch.requestPaused)
+            // can't block other connections — notably route.fetch's own
+            // independent request back to this server.
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut sock = sock;
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
         }
     });
 
@@ -69,25 +77,30 @@ pub async fn http_server_routes(routes: &[(&'static str, &'static str)]) -> Stri
 
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf).await;
-            let req = String::from_utf8_lossy(&buf);
-            // Parse the request line: "GET <path> HTTP/1.1"
-            let path = req
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("/")
-                .to_string();
-            let body = bodies.get(path.as_str()).copied().unwrap_or(default);
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            let _ = sock.flush().await;
+            let Ok((sock, _)) = listener.accept().await else { break };
+            let bodies = bodies.clone();
+            // Per-connection task: a stalled connection must not block others.
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut sock = sock;
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let req = String::from_utf8_lossy(&buf);
+                // Parse the request line: "GET <path> HTTP/1.1"
+                let path = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let body = bodies.get(path.as_str()).copied().unwrap_or(default);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            });
         }
     });
 
