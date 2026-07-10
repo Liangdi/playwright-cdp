@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 
 /// A page (tab) in a browser.
 #[derive(Clone)]
@@ -51,6 +52,10 @@ pub struct Page {
 
 type CloseHandler =
     Arc<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// An erased popup handler: takes the popup [`Page`] and resolves when done.
+type PopupHandler =
+    Arc<dyn Fn(Page) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// An erased, callable binding: takes the JS args and returns a JSON value.
 type ExposedBindingHandler =
@@ -79,6 +84,10 @@ struct PageInner {
     route_handlers: Arc<Mutex<Vec<RouteEntry>>>,
     route_started: AtomicBool,
     on_close_handlers: Mutex<Vec<CloseHandler>>,
+    // Popup (window.open) capture: erased handlers + a one-shot flag for
+    // enabling page-session child-target auto-attach.
+    on_popup_handlers: Arc<Mutex<Vec<PopupHandler>>>,
+    popup_started: AtomicBool,
     closed: Mutex<bool>,
     // Download capture: the temp dir (kept alive for the page's lifetime), its
     // path, per-guid progress state, and a one-shot flag for behavior setup.
@@ -209,6 +218,8 @@ impl Page {
                 route_handlers: Arc::new(Mutex::new(Vec::new())),
                 route_started: AtomicBool::new(false),
                 on_close_handlers: Mutex::new(Vec::new()),
+                on_popup_handlers: Arc::new(Mutex::new(Vec::new())),
+                popup_started: AtomicBool::new(false),
                 closed: Mutex::new(false),
                 download_dir: Mutex::new(None),
                 download_path: Mutex::new(None),
@@ -269,7 +280,12 @@ impl Page {
                 .send("Emulation.setUserAgentOverride", json!({ "userAgent": ua }))
                 .await;
         }
-        if let Some(vp) = page.inner.viewport.lock().as_ref().copied() {
+        // Drop the mutex guard before the `.await` below so the (non-`Send`)
+        // `parking_lot::MutexGuard` is not held across an await point — this
+        // keeps `Page::attach`'s returned future `Send`, which `tokio::spawn`
+        // callers (e.g. `on_popup`) require.
+        let vp = page.inner.viewport.lock().as_ref().copied();
+        if let Some(vp) = vp {
             let _ = page.set_viewport_size(vp).await;
         }
 
@@ -1465,6 +1481,71 @@ impl Page {
         self.inner.on_request_handlers.lock().push(h);
     }
 
+    /// Wait for a network request whose URL contains `url_predicate`, returning
+    /// it. Times out after `timeout` (default 30s) with [`Error::Timeout`].
+    ///
+    /// The matcher is a plain substring test against the request URL
+    /// (`str::contains`), not a regex or glob — keep predicates literal.
+    ///
+    /// A one-shot handler is registered with [`on_request`](Self::on_request);
+    /// it sends the first matching event over a `tokio::sync::oneshot` channel
+    /// and then drains its sender to `None`, so subsequent events are no-ops.
+    /// The handler is *not* removed from the handler list after it fires — it
+    /// simply has nothing to send — so it is idempotent and harmless to leave
+    /// in place (one extra closure in a `Vec`, no side effects).
+    ///
+    /// Typical use races the wait against the action that triggers the request:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &playwright_cdp::Page) {
+    /// let button = page.locator("button#submit");
+    /// let (req, _) = tokio::join!(
+    ///     page.expect_request("/api/login", Some(Duration::from_secs(5))),
+    ///     button.click(None),
+    /// );
+    /// let req = req.unwrap();
+    /// assert!(req.url().contains("/api/login"));
+    /// # }
+    /// ```
+    pub async fn expect_request(
+        &self,
+        url_predicate: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Request> {
+        let (tx, rx) = oneshot::channel::<Request>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        // Own the predicate so the `'static` handler closure can capture it.
+        let url_predicate = url_predicate.to_string();
+        self.on_request({
+            // Move a separate clone into the closure so the outer binding
+            // remains available for the timeout message below.
+            let url_predicate = url_predicate.clone();
+            move |req| {
+                let tx = Arc::clone(&tx);
+                // The `Fn` closure may fire many times; re-clone per call so the
+                // owned predicate is never consumed.
+                let url_predicate = url_predicate.clone();
+                Box::pin(async move {
+                    if req.url().contains(&url_predicate) {
+                        if let Some(sender) = tx.lock().take() {
+                            let _ = sender.send(req);
+                        }
+                    }
+                })
+            }
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(req)) => Ok(req),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_request: oneshot sender dropped before a match arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(format!(
+                "expect_request: no request matched {url_predicate:?} within the timeout"
+            ))),
+        }
+    }
+
     /// Register a handler invoked for each network response received.
     pub fn on_response<F, Fut>(&self, handler: F)
     where
@@ -1473,6 +1554,120 @@ impl Page {
     {
         let h: ResponseHandler = Arc::new(move |r| Box::pin(handler(r)));
         self.inner.on_response_handlers.lock().push(h);
+    }
+
+    /// Wait for a network response whose URL contains `url_predicate`, returning
+    /// it. Times out after `timeout` (default 30s) with [`Error::Timeout`].
+    ///
+    /// The matcher is a plain substring test against the response URL
+    /// (`str::contains`), not a regex or glob — keep predicates literal.
+    ///
+    /// A one-shot handler is registered with [`on_response`](Self::on_response);
+    /// it sends the first matching event over a `tokio::sync::oneshot` channel
+    /// and then drains its sender to `None`, so subsequent events are no-ops.
+    /// The handler is *not* removed from the handler list after it fires — it
+    /// simply has nothing to send — so it is idempotent and harmless to leave
+    /// in place (one extra closure in a `Vec`, no side effects).
+    ///
+    /// Typical use races the wait against the navigation that triggers it:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &playwright_cdp::Page, url: &str) {
+    /// let (resp, _) = tokio::join!(
+    ///     page.expect_response("127.0.0.1", Some(Duration::from_secs(5))),
+    ///     page.goto(url, None),
+    /// );
+    /// assert_eq!(resp.unwrap().status(), 200);
+    /// # }
+    /// ```
+    pub async fn expect_response(
+        &self,
+        url_predicate: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Response> {
+        let (tx, rx) = oneshot::channel::<Response>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        // Own the predicate so the `'static` handler closure can capture it.
+        let url_predicate = url_predicate.to_string();
+        self.on_response({
+            // Move a separate clone into the closure so the outer binding
+            // remains available for the timeout message below.
+            let url_predicate = url_predicate.clone();
+            move |resp| {
+                let tx = Arc::clone(&tx);
+                // The `Fn` closure may fire many times; re-clone per call so the
+                // owned predicate is never consumed.
+                let url_predicate = url_predicate.clone();
+                Box::pin(async move {
+                    if resp.url().contains(&url_predicate) {
+                        if let Some(sender) = tx.lock().take() {
+                            let _ = sender.send(resp);
+                        }
+                    }
+                })
+            }
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_response: oneshot sender dropped before a match arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(format!(
+                "expect_response: no response matched {url_predicate:?} within the timeout"
+            ))),
+        }
+    }
+
+    /// Wait for the next CDP event whose method equals `event_name`, returning
+    /// its `params`. Times out after `timeout` (default 30s) with
+    /// [`Error::Timeout`].
+    ///
+    /// Subscribes to the page session's event stream, so it only sees events
+    /// emitted **after** this call — race it against the triggering action with
+    /// `tokio::join!`.
+    ///
+    /// Example: wait for the page's load event during navigation.
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &playwright_cdp::Page, url: &str) {
+    /// let (params, _) = tokio::join!(
+    ///     page.expect_event("Page.loadEventFired", Some(Duration::from_secs(5))),
+    ///     page.goto(url, None),
+    /// );
+    /// let _params = params.unwrap();
+    /// # }
+    /// ```
+    pub async fn expect_event(
+        &self,
+        event_name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
+        // Subscribe *before* the triggering action so we capture every event
+        // it produces. New receivers only see events emitted after subscribe.
+        let mut rx = self.inner.session.subscribe();
+        let effective = timeout.unwrap_or(Duration::from_secs(30));
+        let deadline = tokio::time::Instant::now() + effective;
+
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(ev)) if ev.method == event_name => return Ok(ev.params),
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(Error::Timeout(format!(
+                        "expect_event('{event_name}'): event stream closed before a match arrived"
+                    )));
+                }
+                Err(_) => {
+                    return Err(Error::Timeout(format!(
+                        "expect_event('{event_name}') timed out after {}ms",
+                        effective.as_millis()
+                    )));
+                }
+            }
+        }
     }
 
     /// Register a handler invoked when a network request fails.
@@ -1634,6 +1829,372 @@ impl Page {
                     &handler,
                 )
                 .await;
+            });
+        }
+    }
+
+    /// Wait for a download whose URL contains `url_predicate`, returning it.
+    /// Times out after `timeout` (default 30s) with [`Error::Timeout`].
+    ///
+    /// The matcher is a plain substring test against the download URL
+    /// (`str::contains`), not a regex or glob — keep predicates literal.
+    ///
+    /// A one-shot handler is registered with [`on_download`](Self::on_download);
+    /// it sends the first matching event over a `tokio::sync::oneshot` channel
+    /// and then drains its sender to `None`, so subsequent events are no-ops.
+    /// The handler is *not* removed from the handler list after it fires — it
+    /// simply has nothing to send — so it is idempotent and harmless to leave
+    /// in place (one extra closure in a `Vec`, no side effects).
+    ///
+    /// Note that the first `on_download` registration on a page lazily wires up
+    /// `Page.setDownloadBehavior`, so this call implicitly opts the page into
+    /// download routing to a temp dir.
+    ///
+    /// Typical use races the wait against the click that triggers the download:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &playwright_cdp::Page) {
+    /// let link = page.locator("a#download");
+    /// let (dl, _) = tokio::join!(
+    ///     page.expect_download("/report.pdf", Some(Duration::from_secs(5))),
+    ///     link.click(None),
+    /// );
+    /// let dl = dl.unwrap();
+    /// assert!(dl.url().contains("/report.pdf"));
+    /// # }
+    /// ```
+    pub async fn expect_download(
+        &self,
+        url_predicate: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Download> {
+        let (tx, rx) = oneshot::channel::<Download>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        // Own the predicate so the `'static` handler closure can capture it.
+        let url_predicate = url_predicate.to_string();
+        self.on_download({
+            // Move a separate clone into the closure so the outer binding
+            // remains available for the timeout message below.
+            let url_predicate = url_predicate.clone();
+            move |dl| {
+                let tx = Arc::clone(&tx);
+                // The `Fn` closure may fire many times; re-clone per call so the
+                // owned predicate is never consumed.
+                let url_predicate = url_predicate.clone();
+                Box::pin(async move {
+                    if dl.url().contains(&url_predicate) {
+                        if let Some(sender) = tx.lock().take() {
+                            let _ = sender.send(dl);
+                        }
+                    }
+                })
+            }
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(dl)) => Ok(dl),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_download: oneshot sender dropped before a match arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(format!(
+                "expect_download: no download matched {url_predicate:?} within the timeout"
+            ))),
+        }
+    }
+
+    /// Wait for a console message whose text contains `text_predicate`,
+    /// returning it. Times out after `timeout` (default 30s) with
+    /// [`Error::Timeout`].
+    ///
+    /// The matcher is a plain substring test against the console message text
+    /// ([`ConsoleMessage::text`], `str::contains`), not a regex or glob — keep
+    /// predicates literal.
+    ///
+    /// A one-shot handler is registered with [`on_console`](Self::on_console);
+    /// it sends the first matching event over a `tokio::sync::oneshot` channel
+    /// and then drains its sender to `None`, so subsequent events are no-ops.
+    /// The handler task keeps running for the life of the page (one extra
+    /// spawned task, no side effects), mirroring the oneshot pattern used by
+    /// the other `expect_*` helpers.
+    ///
+    /// Typical use races the wait against the script that logs the message:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &playwright_cdp::Page) {
+    /// let (msg, _) = tokio::join!(
+    ///     page.expect_console_message("hello", Some(Duration::from_secs(5))),
+    ///     page.evaluate::<()>("console.log('hello world')"),
+    /// );
+    /// assert!(msg.unwrap().text().contains("hello"));
+    /// # }
+    /// ```
+    pub async fn expect_console_message(
+        &self,
+        text_predicate: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ConsoleMessage> {
+        let (tx, rx) = oneshot::channel::<ConsoleMessage>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        // Own the predicate so the `'static` handler closure can capture it.
+        let text_predicate = text_predicate.to_string();
+        self.on_console({
+            // Move a separate clone into the closure so the outer binding
+            // remains available for the timeout message below.
+            let text_predicate = text_predicate.clone();
+            move |msg| {
+                let tx = Arc::clone(&tx);
+                // The `Fn` closure may fire many times; re-clone per call so the
+                // owned predicate is never consumed.
+                let text_predicate = text_predicate.clone();
+                Box::pin(async move {
+                    if msg.text().contains(&text_predicate) {
+                        if let Some(sender) = tx.lock().take() {
+                            let _ = sender.send(msg);
+                        }
+                    }
+                })
+            }
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_console_message: oneshot sender dropped before a match arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(format!(
+                "expect_console_message: no message matched {text_predicate:?} within the timeout"
+            ))),
+        }
+    }
+
+    /// Wait for a popup (`window.open`) opened by this page, returning it as a
+    /// new [`Page`]. Times out after `timeout` (default 30s) with
+    /// [`Error::Timeout`].
+    ///
+    /// # Implementation (polling-based)
+    ///
+    /// A popup (`window.open`) is a new top-level page target rather than a
+    /// child of this page's target, so child-target auto-attach does not surface
+    /// it (and `Target.targetCreated` does not fire for popups on stock Chrome
+    /// in this setup, while `Target.getTargets` omits `openerId`). This helper
+    /// therefore registers a one-shot handler with
+    /// [`on_popup`](Self::on_popup), which polls `Target.getTargets` and treats
+    /// the first new `type == "page"` target in this page's browser context as
+    /// the popup. See [`on_popup`](Self::on_popup) for the full limitations.
+    ///
+    /// The popup [`Page`] is built with an empty init-script set and this
+    /// page's default timeout; per-context defaults (extra headers, user
+    /// agent, viewport) are not re-applied, since `Page` does not expose them
+    /// as raw values. This is sufficient for typical popup-driving flows
+    /// (interact with the popup, then close it).
+    ///
+    /// Typical use races the wait against the script that opens the popup:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &playwright_cdp::Page) {
+    /// let (popup, _) = tokio::join!(
+    ///     page.expect_popup(Some(Duration::from_secs(5))),
+    ///     page.evaluate::<()>("window.open('about:blank')"),
+    /// );
+    /// let _popup = popup.unwrap();
+    /// # }
+    /// ```
+    pub async fn expect_popup(&self, timeout: Option<Duration>) -> Result<Page> {
+        let (tx, rx) = oneshot::channel::<Page>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        self.on_popup(move |popup| {
+            let tx = Arc::clone(&tx);
+            Box::pin(async move {
+                if let Some(sender) = tx.lock().take() {
+                    let _ = sender.send(popup);
+                }
+            })
+        })
+        .await;
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(popup)) => Ok(popup),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_popup: oneshot sender dropped before a popup arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(
+                "expect_popup: no popup opened within the timeout".into(),
+            )),
+        }
+    }
+
+    /// Register a handler invoked when this page opens a popup (`window.open`),
+    /// mirroring Playwright's `page.on('popup')`.
+    ///
+    /// # Implementation (polling, not event-driven)
+    ///
+    /// A popup is a brand-new top-level page target, *not* a child of this
+    /// page's target, so this page session's `Target.setAutoAttach` does not
+    /// surface it (and, empirically, `Target.setDiscoverTargets` /
+    /// `Target.targetCreated` do not fire for `window.open` popups on stock
+    /// Chrome in this setup). `Target.getTargets` also omits `openerId`, so
+    /// strict opener attribution is not available.
+    ///
+    /// Instead, on first registration a background task polls `Target.getTargets`
+    /// on a short interval. Any `type == "page"` target that shares this page's
+    /// `browserContextId`, is not this page itself, and has not already been
+    /// delivered is treated as the popup: the task attaches to it
+    /// (`Target.attachToTarget { flatten }`), builds a full [`Page`] via
+    /// [`Page::attach`], and hands it to every registered handler. A `delivered`
+    /// set (rather than a registration-time baseline) is used because a baseline
+    /// diff races with the trigger under `tokio::join!` — the popup can appear
+    /// before the snapshot completes.
+    ///
+    /// **Limitations** (documented honestly): attribution is "any page target in
+    /// this browser context that isn't this page," not opener-precise, so it can
+    /// misattribute if another page already exists or is opened concurrently in
+    /// the same context. Each distinct popup target fires the handlers once.
+    ///
+    /// The popup [`Page`] is built with an empty init-scripts set and this
+    /// page's default timeout; context-level defaults (extra headers, user
+    /// agent, viewport) are not re-applied (see [`expect_popup`](Self::expect_popup)).
+    pub async fn on_popup<F, Fut>(&self, handler: F)
+    where
+        F: Fn(Page) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        // Record this handler so the background task dispatches to it.
+        let handler: PopupHandler = Arc::new(move |p| Box::pin(handler(p)));
+        self.inner.on_popup_handlers.lock().push(handler);
+
+        // Lazily spawn the popup poller once.
+        if self
+            .inner
+            .popup_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let browser = self.inner.browser.clone();
+            let default_timeout_ms = self.inner.default_timeout_ms.load(Ordering::Relaxed);
+            let opener_target_id = self.inner.target_id.clone();
+            let handlers = Arc::clone(&self.inner.on_popup_handlers);
+            let browser_session = browser.new_browser_cdp_session();
+
+            tokio::spawn(async move {
+                // Determine this page's browserContextId (and the baseline set
+                // of already-existing page targets) so we only surface brand-new
+                // page targets in the same context.
+                let resp = match browser_session
+                    .send("Target.getTargets", json!({}))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let targets = resp
+                    .get("targetInfos")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                // This page's context id (look it up by target id).
+                let my_context = targets
+                    .iter()
+                    .find(|t| {
+                        t.get("targetId").and_then(|v| v.as_str()) == Some(&opener_target_id)
+                    })
+                    .and_then(|t| t.get("browserContextId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                // Track which popup targets we have already delivered, so each
+                // distinct popup fires the handlers exactly once. We do NOT
+                // snapshot a baseline: a baseline diff races with the trigger
+                // under `tokio::join!` (the popup can appear before the
+                // snapshot completes). Instead we deliver every same-context
+                // page target that isn't this page itself and that we haven't
+                // already handed off. This assumes no pre-existing unrelated
+                // page target in the same browser context at registration time
+                // (true for the common one-page-then-popup flow).
+                let mut delivered: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let resp = match browser_session.send("Target.getTargets", json!({})).await {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let targets = match resp.get("targetInfos").and_then(|v| v.as_array()) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    // Undelivered page targets in the same context (excluding
+                    // this page itself).
+                    let new_popups: Vec<&Value> = targets
+                        .iter()
+                        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+                        .filter(|t| {
+                            my_context
+                                .as_deref()
+                                .zip(t.get("browserContextId").and_then(|v| v.as_str()))
+                                .map(|(mc, c)| mc == c)
+                                .unwrap_or(true)
+                        })
+                        .filter(|t| {
+                            t.get("targetId")
+                                .and_then(|v| v.as_str())
+                                .map(|id| {
+                                    !delivered.contains(id) && id != opener_target_id
+                                })
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    if new_popups.is_empty() {
+                        continue;
+                    }
+                    for np in new_popups {
+                        let target_id = match np.get("targetId").and_then(|v| v.as_str()) {
+                            Some(id) => id.to_string(),
+                            None => continue,
+                        };
+                        delivered.insert(target_id.clone());
+                        // Attach to the popup target to obtain a session id.
+                        let attach = match browser_session
+                            .send(
+                                "Target.attachToTarget",
+                                json!({ "targetId": target_id, "flatten": true }),
+                            )
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let sid = match attach.get("sessionId").and_then(|v| v.as_str()) {
+                            Some(s) => s.to_string(),
+                            None => continue,
+                        };
+                        // Build a full Page for the popup target, mirroring
+                        // BrowserContext::new_page (empty init scripts / no
+                        // extra defaults — see the doc on `expect_popup`).
+                        let popup = match Page::attach(
+                            browser.clone(),
+                            sid,
+                            target_id,
+                            &[],
+                            default_timeout_ms,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        // Snapshot the current handlers and dispatch to each.
+                        let snapshot = handlers.lock().clone();
+                        for h in snapshot {
+                            let p = popup.clone();
+                            tokio::spawn(async move {
+                                (h)(p).await;
+                            });
+                        }
+                    }
+                }
             });
         }
     }

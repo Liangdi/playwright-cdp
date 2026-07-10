@@ -6,6 +6,7 @@
 //! API shape parity and resolve to Chromium (with a warning).
 
 use crate::browser::Browser;
+use crate::browser_context::BrowserContext;
 use crate::browser_process;
 use crate::error::Result;
 use crate::options::{ConnectOverCdpOptions, LaunchOptions};
@@ -66,6 +67,48 @@ impl BrowserType {
             );
         }
         Browser::launch(opts).await
+    }
+
+    /// Launch a browser with a persistent user-data-dir and return its default
+    /// [`BrowserContext`]. Cookies / localStorage persist to `user_data_dir`
+    /// across runs. Mirrors Playwright's `browserType.launchPersistentContext`.
+    ///
+    /// `user_data_dir` accepts any path-like value (`impl AsRef<Path>`), so you
+    /// can pass a `&str`, `&Path`, `&PathBuf`, or an owned `PathBuf` directly.
+    pub async fn launch_persistent_context(
+        &self,
+        user_data_dir: impl AsRef<std::path::Path>,
+    ) -> Result<BrowserContext> {
+        self.launch_persistent_context_with_options(user_data_dir, LaunchOptions::default())
+            .await
+    }
+
+    /// Like [`launch_persistent_context`](Self::launch_persistent_context) but with
+    /// custom launch options. The `user_data_dir` passed here overrides any
+    /// `user_data_dir` set on `opts`.
+    ///
+    /// `user_data_dir` accepts any path-like value (`impl AsRef<Path>`), so you
+    /// can pass a `&str`, `&Path`, `&PathBuf`, or an owned `PathBuf` directly.
+    pub async fn launch_persistent_context_with_options(
+        &self,
+        user_data_dir: impl AsRef<std::path::Path>,
+        mut opts: LaunchOptions,
+    ) -> Result<BrowserContext> {
+        if !matches!(self.engine, Engine::Chromium) {
+            tracing::warn!(
+                engine = self.name(),
+                "playwright-cdp only drives Chromium via CDP; launching Chromium instead"
+            );
+        }
+        opts.user_data_dir = Some(PathBuf::from(user_data_dir.as_ref()));
+        let browser = Browser::launch(opts).await?;
+        // The persistent context is the browser's default (non-isolated) context:
+        // browser_context_id == None, backed by the on-disk user-data-dir.
+        let ctx = BrowserContext::default_for(browser);
+        // Owning context: close() must tear the whole browser down, matching
+        // Playwright's persistent-context semantics.
+        ctx.mark_persistent();
+        Ok(ctx)
     }
 
     /// Attach to an already-running browser over CDP.

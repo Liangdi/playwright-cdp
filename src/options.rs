@@ -23,6 +23,10 @@ pub struct LaunchOptions {
     pub traces_dir: Option<String>,
     pub devtools: Option<bool>,
     pub chromium_sandbox: Option<bool>,
+    /// Optional persistent user-data-dir. When set, the browser is launched
+    /// against this directory instead of a throwaway temp dir, so cookies,
+    /// localStorage, etc. persist across runs (Playwright `userDataDir`).
+    pub user_data_dir: Option<std::path::PathBuf>,
 }
 
 impl LaunchOptions {
@@ -55,6 +59,11 @@ impl LaunchOptions {
     }
     pub fn devtools(mut self, v: bool) -> Self {
         self.devtools = Some(v);
+        self
+    }
+    /// Set a persistent user-data-dir (Playwright `userDataDir`).
+    pub fn user_data_dir(mut self, v: impl Into<std::path::PathBuf>) -> Self {
+        self.user_data_dir = Some(v.into());
         self
     }
 

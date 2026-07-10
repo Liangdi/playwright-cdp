@@ -69,7 +69,7 @@ pub mod js_handle;
 pub mod accessibility;
 pub mod har;
 
-pub use api_request::{APIRequestContext, APIResponse};
+pub use api_request::{APIRequestContext, APIResponse, ApiRequestContextOptions};
 pub use assertions::{expect, expect_page, LocatorAssertions, PageAssertions};
 pub use browser::Browser;
 pub use browser_context::BrowserContext;
@@ -89,7 +89,7 @@ pub use playwright::Playwright;
 pub use request::Request;
 pub use response::Response;
 pub use options::APIRequestOptions;
-pub use route::{Route, RouteContinueOptions, RouteFulfillOptions};
+pub use route::{Route, RouteContinueOptions, RouteFetchOptions, RouteFetchResponse, RouteFulfillOptions};
 pub use types::{AriaRole, ConsoleMessage, MouseButton, NameValue, OriginStorage, Position, StorageState, Viewport};
 pub use tracing::Tracing;
 pub use touchscreen::Touchscreen;

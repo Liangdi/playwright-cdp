@@ -415,24 +415,14 @@ fn decode_body(content: &HarContent) -> (Vec<u8>, bool) {
     }
 }
 
-/// Glob match compatible with the route pattern semantics: `*` matches any
-/// sequence. `*foo*` is a substring test; `foo*` a prefix; `*foo` a suffix;
-/// otherwise an exact/contains match. Mirrors `route::pattern_matches` so the
-/// `opts.url` filter behaves the same way the registered patterns will.
+/// Glob match compatible with the route pattern semantics.
+///
+/// This is a thin wrapper over [`crate::route::pattern_matches`] so that the
+/// `opts.url` filter behaves identically to the registered route patterns,
+/// including the full Playwright URL glob syntax (`**`, `*`, `?`, `[abc]`).
+/// See `route::pattern_matches` for the exact semantics.
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
-    if pattern == url {
-        return true;
-    }
-    if pattern.len() >= 2 && pattern.starts_with('*') && pattern.ends_with('*') {
-        return url.contains(&pattern[1..pattern.len() - 1]);
-    }
-    if let Some(rest) = pattern.strip_prefix('*') {
-        return url.ends_with(rest);
-    }
-    if let Some(rest) = pattern.strip_suffix('*') {
-        return url.starts_with(rest);
-    }
-    url.contains(pattern)
+    crate::route::pattern_matches(pattern, url)
 }
 
 // ---------------------------------------------------------------------------

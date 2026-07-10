@@ -19,8 +19,10 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 type PageHandler = Arc<
     dyn Fn(Page) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
@@ -97,6 +99,12 @@ struct ContextInner {
     /// See [`BrowserContext::clock`] / [`BrowserContext::set_clock_install`].
     pending_clock_install: Mutex<Option<ClockInstallOptions>>,
     closed: Mutex<bool>,
+    /// `true` for the context returned by `launch_persistent_context`: its
+    /// [`close`](BrowserContext::close) owns the browser process and must tear
+    /// the whole browser down (matching Playwright's persistent-context
+    /// semantics). `false` for isolated contexts and the ephemeral default
+    /// handle used by `Browser::new_page`.
+    owns_browser: AtomicBool,
 
     // --- Context-level event handler lists (fan out to every page) ---
     on_close_handlers: Mutex<Vec<CloseHandler>>,
@@ -170,6 +178,7 @@ impl BrowserContext {
                 tracing,
                 pending_clock_install: Mutex::new(None),
                 closed: Mutex::new(false),
+                owns_browser: AtomicBool::new(false),
                 on_close_handlers: Mutex::new(Vec::new()),
                 on_console_handlers: Mutex::new(Vec::new()),
                 on_request_handlers: Mutex::new(Vec::new()),
@@ -556,7 +565,22 @@ impl BrowserContext {
                 .send("Target.disposeBrowserContext", json!({"browserContextId": bcid}))
                 .await;
         }
+
+        // A persistent context (launch_persistent_context) owns the browser
+        // process: closing it must tear down the whole browser, like
+        // Playwright's persistent context. Isolated/ephemeral contexts leave
+        // the shared browser alive.
+        if self.inner.owns_browser.load(Ordering::SeqCst) {
+            let _ = self.inner.browser.close().await;
+        }
         Ok(())
+    }
+
+    /// Mark this context as owning the underlying browser process, so that
+    /// [`close`](Self::close) tears the browser down. Used by
+    /// [`BrowserType::launch_persistent_context`].
+    pub(crate) fn mark_persistent(&self) {
+        self.inner.owns_browser.store(true, Ordering::SeqCst);
     }
 
     // ----- Permissions & storage -----
@@ -998,6 +1022,179 @@ impl BrowserContext {
                 let hh = h.clone();
                 async move { (hh)(r).await }
             });
+        }
+    }
+
+    /// Wait for the context to produce a new page (via `new_page` or a
+    /// `window.open` popup), returning it. Times out after `timeout`
+    /// (default 30s) with [`Error::Timeout`].
+    ///
+    /// A one-shot handler is registered with [`on_page`](Self::on_page); it
+    /// sends the first page over a `tokio::sync::oneshot` channel and then
+    /// drains its sender to `None`, so subsequent events are no-ops. The
+    /// handler is *not* removed from the handler list after it fires — it
+    /// simply has nothing to send — so it is idempotent and harmless to leave
+    /// in place (one extra closure in a `Vec`, no side effects).
+    ///
+    /// Typical use races the wait against the action that opens the page:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(ctx: &playwright_cdp::BrowserContext) {
+    /// let (page, _) = tokio::join!(
+    ///     ctx.expect_page(Some(Duration::from_secs(5))),
+    ///     ctx.new_page(),
+    /// );
+    /// page.unwrap().close().await.ok();
+    /// # }
+    /// ```
+    pub async fn expect_page(&self, timeout: Option<Duration>) -> Result<Page> {
+        let (tx, rx) = oneshot::channel::<Page>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        self.on_page(move |page| {
+            let tx = Arc::clone(&tx);
+            Box::pin(async move {
+                if let Some(sender) = tx.lock().take() {
+                    let _ = sender.send(page);
+                }
+            })
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(page)) => Ok(page),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_page: oneshot sender dropped before a page arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(
+                "expect_page: no page opened within the timeout".into(),
+            )),
+        }
+    }
+
+    /// Wait for a request whose URL contains `url_predicate` on any page in
+    /// this context, returning it. Times out after `timeout` (default 30s)
+    /// with [`Error::Timeout`].
+    ///
+    /// The matcher is a plain substring test against the request URL
+    /// (`str::contains`), not a regex or glob — keep predicates literal.
+    ///
+    /// A one-shot handler is registered with [`on_request`](Self::on_request);
+    /// it sends the first matching event over a `tokio::sync::oneshot` channel
+    /// and then drains its sender to `None`, so subsequent events are no-ops.
+    /// The handler is *not* removed from the handler list after it fires — it
+    /// simply has nothing to send — so it is idempotent and harmless to leave
+    /// in place (one extra closure in a `Vec`, no side effects).
+    ///
+    /// Typical use races the wait against the navigation that triggers it:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(ctx: &playwright_cdp::BrowserContext, page: &playwright_cdp::Page, url: &str) {
+    /// let (req, _) = tokio::join!(
+    ///     ctx.expect_request("127.0.0.1", Some(Duration::from_secs(5))),
+    ///     page.goto(url, None),
+    /// );
+    /// req.unwrap().url().to_string();
+    /// # }
+    /// ```
+    pub async fn expect_request(
+        &self,
+        url_predicate: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Request> {
+        let (tx, rx) = oneshot::channel::<Request>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        // Own the predicate so the `'static` handler closure can capture it.
+        let url_predicate = url_predicate.to_string();
+        self.on_request({
+            // Move a separate clone into the closure so the outer binding
+            // remains available for the timeout message below.
+            let url_predicate = url_predicate.clone();
+            move |req| {
+                let tx = Arc::clone(&tx);
+                // The `Fn` closure may fire many times; re-clone per call so the
+                // owned predicate is never consumed.
+                let url_predicate = url_predicate.clone();
+                Box::pin(async move {
+                    if req.url().contains(&url_predicate) {
+                        if let Some(sender) = tx.lock().take() {
+                            let _ = sender.send(req);
+                        }
+                    }
+                })
+            }
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(req)) => Ok(req),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_request: oneshot sender dropped before a match arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(format!(
+                "expect_request: no request matched {url_predicate:?} within the timeout"
+            ))),
+        }
+    }
+
+    /// Wait for a console message whose text contains `text_predicate` on any
+    /// page in this context, returning it. Times out after `timeout`
+    /// (default 30s) with [`Error::Timeout`].
+    ///
+    /// The matcher is a plain substring test against the message text
+    /// (`str::contains`), not a regex or glob — keep predicates literal.
+    ///
+    /// A one-shot handler is registered with [`on_console`](Self::on_console);
+    /// it sends the first matching event over a `tokio::sync::oneshot` channel
+    /// and then drains its sender to `None`, so subsequent events are no-ops.
+    /// The handler is *not* removed from the handler list after it fires — it
+    /// simply has nothing to send — so it is idempotent and harmless to leave
+    /// in place (one extra closure in a `Vec`, no side effects).
+    ///
+    /// Typical use races the wait against the action that logs the message:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(ctx: &playwright_cdp::BrowserContext, page: &playwright_cdp::Page) {
+    /// let (msg, _) = tokio::join!(
+    ///     ctx.expect_console("hello", Some(Duration::from_secs(5))),
+    ///     page.evaluate::<()>("console.log('hello world')"),
+    /// );
+    /// msg.unwrap().text().to_string();
+    /// # }
+    /// ```
+    pub async fn expect_console(
+        &self,
+        text_predicate: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ConsoleMessage> {
+        let (tx, rx) = oneshot::channel::<ConsoleMessage>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        // Own the predicate so the `'static` handler closure can capture it.
+        let text_predicate = text_predicate.to_string();
+        self.on_console({
+            // Move a separate clone into the closure so the outer binding
+            // remains available for the timeout message below.
+            let text_predicate = text_predicate.clone();
+            move |msg| {
+                let tx = Arc::clone(&tx);
+                // The `Fn` closure may fire many times; re-clone per call so the
+                // owned predicate is never consumed.
+                let text_predicate = text_predicate.clone();
+                Box::pin(async move {
+                    if msg.text().contains(&text_predicate) {
+                        if let Some(sender) = tx.lock().take() {
+                            let _ = sender.send(msg);
+                        }
+                    }
+                })
+            }
+        });
+        match tokio::time::timeout(timeout.unwrap_or_else(|| Duration::from_secs(30)), rx).await {
+            Ok(Ok(msg)) => Ok(msg),
+            Ok(Err(_)) => Err(Error::Timeout(
+                "expect_console: oneshot sender dropped before a match arrived".into(),
+            )),
+            Err(_) => Err(Error::Timeout(format!(
+                "expect_console: no console message matched {text_predicate:?} within the timeout"
+            ))),
         }
     }
 

@@ -18,6 +18,13 @@ exclude = ["cliff.toml", "justfile", "release.toml", "/examples_out", "/demo.png
 name = "playwright_cdp"
 path = "src/lib.rs"
 
+[features]
+# Enable pixel-level tolerance comparison for `to_have_screenshot` (decodes PNGs
+# via the `image` crate and counts differing pixels). Default OFF — without this
+# feature, screenshot assertions fall back to exact byte comparison and `image`
+# is neither downloaded nor compiled.
+screenshot-diff = ["dep:image"]
+
 [dependencies]
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -44,8 +51,12 @@ reqwest = { version = "0.13", default-features = false, features = [
 tempfile = "3"
 dirs = "6"
 parking_lot = "0.12"
+regex = "1"
 tracing = "0.1"
 base64 = "0.22"
+# Optional: enables pixel-tolerance comparison in `to_have_screenshot` via the
+# `screenshot-diff` feature. Only the PNG decoder is pulled in.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [dev-dependencies]
 anyhow = "1"

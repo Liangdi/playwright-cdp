@@ -17,6 +17,86 @@ use crate::error::{Error, Result};
 use crate::options::APIRequestOptions;
 use crate::types::Headers;
 
+/// Configuration for building an [`APIRequestContext`].
+///
+/// Mirrors the relevant subset of Playwright's `newContext({ baseURL, ... })`
+/// options that apply to a standalone API request context. Use [`Default`] for
+/// sensible no-op defaults, then chain the builder setters:
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use playwright_cdp::api_request::ApiRequestContextOptions;
+/// let opts = ApiRequestContextOptions::default()
+///     .base_url("https://api.example.com")
+///     .user_agent("my-bot/1.0")
+///     .timeout(Duration::from_secs(30))
+///     .ignore_https_errors(true);
+/// ```
+///
+/// See: <https://playwright.dev/docs/api/class-apirequestcontext>
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ApiRequestContextOptions {
+    /// Base URL prepended to any relative request URL (one that does not start
+    /// with `http://` or `https://`).
+    pub base_url: Option<String>,
+    /// `User-Agent` header applied to every request. Per-request headers take
+    /// precedence.
+    pub user_agent: Option<String>,
+    /// Default per-request timeout. Overridden by a per-request `timeout` in
+    /// [`APIRequestOptions`].
+    pub timeout: Option<Duration>,
+    /// When true, the underlying `reqwest::Client` accepts invalid TLS
+    /// certificates (mirrors Playwright's `ignoreHTTPSErrors`).
+    pub ignore_https_errors: bool,
+    /// Extra headers merged into every request, below per-request headers.
+    pub extra_http_headers: Headers,
+}
+
+impl ApiRequestContextOptions {
+    /// Start from defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the base URL prepended to relative request URLs.
+    pub fn base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = Some(url.into());
+        self
+    }
+
+    /// Set the `User-Agent` header applied to every request.
+    pub fn user_agent(mut self, ua: impl Into<String>) -> Self {
+        self.user_agent = Some(ua.into());
+        self
+    }
+
+    /// Set the default per-request timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// When true, accept invalid TLS certificates.
+    pub fn ignore_https_errors(mut self, ignore: bool) -> Self {
+        self.ignore_https_errors = ignore;
+        self
+    }
+
+    /// Set the extra headers merged into every request (replaces any
+    /// previously set extras).
+    pub fn extra_http_headers(mut self, headers: Headers) -> Self {
+        self.extra_http_headers = headers;
+        self
+    }
+
+    /// Add a single extra header.
+    pub fn extra_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_http_headers.insert(name.into(), value.into());
+        self
+    }
+}
+
 /// A standalone HTTP client. Cheap to clone — it shares one underlying
 /// `reqwest::Client` and a set of default headers.
 ///
@@ -25,24 +105,58 @@ use crate::types::Headers;
 pub struct APIRequestContext {
     client: reqwest::Client,
     default_headers: Headers,
+    options: ApiRequestContextOptions,
 }
 
 impl APIRequestContext {
     /// Create a new context with the given default headers (cloned into the
     /// context). A fresh `reqwest::Client` is built once and reused.
+    ///
+    /// Equivalent to [`APIRequestContext::new_with_options`] with the headers
+    /// passed as `extra_http_headers` and all other options at their defaults.
     pub fn new(default_headers: Headers) -> Self {
-        let client = reqwest::Client::builder()
+        let mut options = ApiRequestContextOptions::default();
+        options.extra_http_headers = default_headers;
+        Self::new_with_options(options)
+    }
+
+    /// Create a new context from a full [`ApiRequestContextOptions`]. The
+    /// underlying `reqwest::Client` is built once (honoring
+    /// `ignore_https_errors` and the default `timeout`) and reused for every
+    /// request.
+    pub fn new_with_options(options: ApiRequestContextOptions) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if options.ignore_https_errors {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+        if let Some(timeout) = options.timeout {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(user_agent) = options.user_agent.as_deref() {
+            builder = builder.user_agent(user_agent);
+        }
+        let client = builder
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // The default headers served to `default_headers()` are the
+        // `extra_http_headers` from the options.
+        let default_headers = options.extra_http_headers.clone();
         Self {
             client,
             default_headers,
+            options,
         }
     }
 
-    /// The default headers carried by this context.
+    /// The default headers carried by this context (seeded from
+    /// `extra_http_headers`).
     pub fn default_headers(&self) -> &Headers {
         &self.default_headers
+    }
+
+    /// The options this context was built with.
+    pub fn options(&self) -> &ApiRequestContextOptions {
+        &self.options
     }
 
     /// `GET`.
@@ -79,6 +193,28 @@ impl APIRequestContext {
         self.send(reqwest::Method::HEAD, url, options).await
     }
 
+    /// Resolve `url` against the configured base URL. Relative URLs (those not
+    /// starting with `http://` or `https://`) are joined onto `base_url`;
+    /// absolute URLs are returned verbatim. When no base URL is configured the
+    /// input is returned unchanged.
+    fn resolve_url(&self, url: &str) -> String {
+        let Some(base) = self.options.base_url.as_deref() else {
+            return url.to_string();
+        };
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return url.to_string();
+        }
+        // Join base + relative, handling the leading '/' on either side so we
+        // avoid accidental double or missing slashes.
+        let base = base.trim_end_matches('/');
+        let path = if url.starts_with('/') {
+            url.to_string()
+        } else {
+            format!("/{url}")
+        };
+        format!("{base}{path}")
+    }
+
     /// Build + send a request for `method`, applying options, then capture the
     /// full body so accessors are cheap.
     async fn send(
@@ -88,7 +224,16 @@ impl APIRequestContext {
         options: Option<APIRequestOptions>,
     ) -> Result<APIResponse> {
         let options = options.unwrap_or_default();
-        let mut builder = self.client.request(method, url);
+
+        // Resolve a relative URL against the configured base URL. Absolute URLs
+        // (and other schemes) are used verbatim.
+        let url = self.resolve_url(url);
+
+        let mut builder = self.client.request(method, &url);
+
+        // The context-wide user_agent is already baked into the shared client
+        // (set via ClientBuilder). Per-request headers below can still override
+        // it by setting `User-Agent` explicitly.
 
         // Default headers first, then per-request overrides.
         for (k, v) in &self.default_headers {
@@ -112,7 +257,7 @@ impl APIRequestContext {
             builder = builder.form(form);
         }
 
-        // Per-request timeout.
+        // Per-request timeout overrides the context default.
         if let Some(timeout_ms) = options.timeout {
             builder = builder.timeout(Duration::from_millis(timeout_ms.max(0.0) as u64));
         }

@@ -9,11 +9,29 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 
+/// How the user-data-dir is owned.
+enum UserDataDir {
+    /// Self-created temp dir; must be held to live for the process lifetime
+    /// and cleaned up on drop.
+    Owned(tempfile::TempDir),
+    /// User-supplied persistent path; not managed by us.
+    Borrowed(std::path::PathBuf),
+}
+
+impl UserDataDir {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            UserDataDir::Owned(t) => t.path(),
+            UserDataDir::Borrowed(p) => p,
+        }
+    }
+}
+
 /// The result of launching a browser: the owning process handle plus the
 /// browser-level WebSocket endpoint to connect to.
 pub struct BrowserProcess {
     child: Option<Child>,
-    _user_data_dir: tempfile::TempDir,
+    user_data_dir: UserDataDir,
     ws_url: String,
     stderr_buf: std::sync::Arc<parking_lot::Mutex<String>>,
 }
@@ -25,10 +43,23 @@ impl BrowserProcess {
         let executable = discover_executable(opts)
             .map_err(|e| e.context("could not find a Chrome/Chromium executable"))?;
 
-        let user_data_dir = tempfile::Builder::new()
-            .prefix("playwright-cdp-")
-            .tempdir()
-            .map_err(|e| Error::Io(e).context("failed to create user-data-dir"))?;
+        // A user-supplied persistent user-data-dir overrides the throwaway
+        // temp dir (Playwright `userDataDir`); the dir is not managed by us.
+        let user_data_dir = match opts.user_data_dir.as_ref() {
+            Some(path) => UserDataDir::Borrowed(path.clone()),
+            None => {
+                let tempdir = tempfile::Builder::new()
+                    .prefix("playwright-cdp-")
+                    .tempdir()
+                    .map_err(|e| Error::Io(e).context("failed to create user-data-dir"))?;
+                UserDataDir::Owned(tempdir)
+            }
+        };
+
+        // Clear a stale DevToolsActivePort left by a previous run against this
+        // (possibly persistent) dir; otherwise wait_for_devtools_port below
+        // could read the old, now-dead port and time out connecting to it.
+        let _ = std::fs::remove_file(user_data_dir.path().join("DevToolsActivePort"));
 
         let mut args = base_args(user_data_dir.path(), opts);
         if opts.headless.unwrap_or(true) {
@@ -95,7 +126,7 @@ impl BrowserProcess {
 
         Ok(Self {
             child: Some(child),
-            _user_data_dir: user_data_dir,
+            user_data_dir: user_data_dir,
             ws_url,
             stderr_buf,
         })
@@ -106,12 +137,23 @@ impl BrowserProcess {
         &self.ws_url
     }
 
-    /// Send SIGKILL (best-effort) and wait for exit.
+    /// Close the browser. We give it up to `GRACE` to exit gracefully (we send
+    /// `Browser.close` over CDP beforehand, which lets Chrome tear down its
+    /// child processes and release profile locks cleanly); if it hasn't exited
+    /// by then we SIGKILL it and clear any stale singleton lock ourselves.
     pub async fn kill(&mut self) -> Result<()> {
+        const GRACE: Duration = Duration::from_secs(2);
         if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            if tokio::time::timeout(GRACE, child.wait()).await.is_err() {
+                // Didn't exit gracefully within GRACE → force kill.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
         }
+        // An abrupt exit (SIGKILL) can leave Chrome's profile singleton files
+        // behind; clear them so the user-data-dir is relaunchable. No-op if
+        // Chrome cleaned up on a graceful exit.
+        remove_stale_singleton_lock(self.user_data_dir.path());
         Ok(())
     }
 
@@ -150,6 +192,17 @@ async fn drain_stderr<R: tokio::io::AsyncRead + Unpin>(
                 }
             }
         }
+    }
+}
+
+/// Remove Chrome's profile singleton files left behind after a SIGKILL, so the
+/// same user-data-dir can be launched again without Chrome refusing it as
+/// "already in use". Best-effort: ignores missing files and errors.
+fn remove_stale_singleton_lock(user_data_dir: &std::path::Path) {
+    for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        // On Unix `SingletonLock` is a symlink; `remove_file` unlinks the
+        // symlink itself rather than any target, which is what we want.
+        let _ = std::fs::remove_file(user_data_dir.join(name));
     }
 }
 
