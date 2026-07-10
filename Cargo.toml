@@ -91,3 +91,23 @@ path = "examples/contexts.rs"
 [[example]]
 name = "bindings"
 path = "examples/bindings.rs"
+
+[[example]]
+name = "clock_example"
+path = "examples/clock_example.rs"
+
+[[example]]
+name = "web_storage_example"
+path = "examples/web_storage_example.rs"
+
+[[example]]
+name = "coverage_example"
+path = "examples/coverage_example.rs"
+
+[[example]]
+name = "accessibility_example"
+path = "examples/accessibility_example.rs"
+
+[[example]]
+name = "har_example"
+path = "examples/har_example.rs"
